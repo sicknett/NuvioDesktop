@@ -118,6 +118,9 @@ object HomeCatalogSettingsRepository {
     private var collectionDefinitions: List<CollectionCatalogDefinition> = emptyList()
     private var lastCatalogSync: CatalogSyncInput? = null
     private var lastCollectionSync: Pair<List<Collection>, String>? = null
+
+    // Collection ids in the order last seen; a change in order between syncs means the user moved one.
+    private var knownCollectionOrder: List<String>? = null
     private val preferencesRef = atomic<Map<String, StoredHomeCatalogPreference>>(emptyMap())
     private var preferences: Map<String, StoredHomeCatalogPreference>
         get() = preferencesRef.value
@@ -140,6 +143,7 @@ object HomeCatalogSettingsRepository {
         lastPersistedPayload = null
         lastCatalogSync = null
         lastCollectionSync = null
+        knownCollectionOrder = null
         _uiState.value = HomeCatalogSettingsUiState()
     }
 
@@ -149,6 +153,7 @@ object HomeCatalogSettingsRepository {
         collectionDefinitions = emptyList()
         lastCatalogSync = null
         lastCollectionSync = null
+        knownCollectionOrder = null
         preferences = emptyMap()
         heroEnabled = true
         showCatalogType = true
@@ -171,6 +176,7 @@ object HomeCatalogSettingsRepository {
         if (lastCatalogSync == syncInput) return
         definitions = buildHomeCatalogDefinitions(addons)
         collectionDefinitions = buildCollectionDefinitions(collections)
+        carryCollectionReorderToHome(collections)
         lastCatalogSync = syncInput
         lastCollectionSync = lastCollectionSync?.takeIf {
             it.first == collections && it.second == syncInput.locale
@@ -203,6 +209,7 @@ object HomeCatalogSettingsRepository {
         if (lastCollectionSync == syncInput) return
         if (definitions.isEmpty()) definitions = buildHomeCatalogDefinitions(addons)
         collectionDefinitions = buildCollectionDefinitions(collections)
+        carryCollectionReorderToHome(collections)
         lastCatalogSync = lastCatalogSync?.takeIf {
             it.collections == collections && it.locale == syncInput.second
         }
@@ -593,6 +600,31 @@ object HomeCatalogSettingsRepository {
             .sortedBy { key -> preferences[key]?.order ?: Int.MAX_VALUE }
     }
 
+    /**
+     * Home row order is stored separately from the order of the collections list, so moving a collection in the
+     * Collections screen used to change nothing on Home. When the same set of collections shows up in a new
+     * order, hand their existing home slots out in that order: collections keep their place among the other
+     * rows and only their order relative to each other changes.
+     */
+    private fun carryCollectionReorderToHome(collections: List<Collection>) {
+        val newOrder = collections.map { it.id }
+        val previousOrder = knownCollectionOrder
+        knownCollectionOrder = newOrder
+        if (previousOrder == null || previousOrder == newOrder || previousOrder.toSet() != newOrder.toSet()) return
+
+        val keyById = collectionDefinitions.associate { it.collectionId to it.key }
+        val keys = newOrder.mapNotNull(keyById::get)
+        if (keys.size != newOrder.size) return
+        val newOrders = collectionOrdersAfterMove(
+            currentOrders = preferences.mapValues { (_, preference) -> preference.order },
+            keysInNewOrder = keys,
+        ) ?: return
+
+        val updated = preferences.toMutableMap()
+        newOrders.forEach { (key, order) -> updated[key] = updated.getValue(key).copy(order = order) }
+        preferences = updated
+    }
+
     private fun enforcePinnedCollectionsAtTop() {
         val orderedKeys = allOrderedKeys()
         if (orderedKeys.isEmpty()) return
@@ -687,3 +719,16 @@ private data class CatalogSyncInput(
     val locale: String,
     val serverRevision: Int,
 )
+
+/**
+ * Hands the home slots the given collections occupy out again in [keysInNewOrder], so each collection keeps its
+ * place among the other rows and only the collections' order relative to each other changes.
+ * Returns null when any key has no current slot.
+ */
+internal fun collectionOrdersAfterMove(
+    currentOrders: Map<String, Int>,
+    keysInNewOrder: List<String>,
+): Map<String, Int>? {
+    val slots = keysInNewOrder.map { key -> currentOrders[key] ?: return null }.sorted()
+    return keysInNewOrder.mapIndexed { index, key -> key to slots[index] }.toMap()
+}
