@@ -61,6 +61,7 @@ object PublicMetaDbTracker : TrackingAuthProvider {
         ids = ids,
         apiKey = { apiKeyForProfile(ProfileRepository.activeProfileId) },
         ensureAccountLoaded = ::ensureLoaded,
+        activeProfileId = { ProfileRepository.activeProfileId },
     )
     internal val writes = PublicMetaDbTrackingWrites(api, ids, progressProvider, ::apiKeyForProfile)
     internal val watchedProvider = PublicMetaDbWatchedProvider(api, ids, ::apiKeyForProfile)
@@ -131,6 +132,7 @@ object PublicMetaDbTracker : TrackingAuthProvider {
         authenticated.value = false
         accountStatus.value = PublicMetaDbAccountStatus()
         progressProvider.clearLocalState()
+        progressProvider.clearPersistedCache(profileId)
     }
 
     /** Pulls resume points now; returns true when the sync finished without an error. */
@@ -156,6 +158,7 @@ object PublicMetaDbTracker : TrackingAuthProvider {
     override fun clearLocalState() {
         (1..MAX_PROFILES).forEach { profileId ->
             PublicMetaDbPlatform.persistence.write(ProfileScopedKey.of(API_KEY_STORAGE_KEY, profileId), null)
+            progressProvider.clearPersistedCache(profileId)
         }
         generation++
         apiKeyState.value = null
@@ -165,6 +168,7 @@ object PublicMetaDbTracker : TrackingAuthProvider {
 
     override fun removeStoredProfile(profileId: Int) {
         PublicMetaDbPlatform.persistence.write(ProfileScopedKey.of(API_KEY_STORAGE_KEY, profileId), null)
+        progressProvider.clearPersistedCache(profileId)
         if (profileId == loadedProfileId) {
             apiKeyState.value = null
             authenticated.value = false

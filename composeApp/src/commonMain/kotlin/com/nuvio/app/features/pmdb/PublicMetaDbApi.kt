@@ -4,6 +4,7 @@ import com.nuvio.app.core.build.AppVersionConfig
 import com.nuvio.app.core.network.createApiHttpClient
 import com.nuvio.app.core.network.readBoundedResponseBody
 import io.ktor.client.HttpClient
+import io.ktor.client.plugins.timeout
 import io.ktor.client.request.header
 import io.ktor.client.request.prepareRequest
 import io.ktor.client.request.setBody
@@ -12,6 +13,7 @@ import io.ktor.http.HttpMethod
 import io.ktor.http.URLBuilder
 import io.ktor.http.contentLength
 import io.ktor.http.encodedPath
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -36,11 +38,20 @@ internal fun interface PublicMetaDbTransport {
     suspend fun send(method: String, url: String, apiKey: String, jsonBody: String?): PublicMetaDbHttpResponse
 }
 
+private const val CONNECT_TIMEOUT_MS = 7_000L
+private const val REQUEST_TIMEOUT_MS = 30_000L
+
 internal class KtorPublicMetaDbTransport(
     private val client: HttpClient = createApiHttpClient(),
 ) : PublicMetaDbTransport {
     override suspend fun send(method: String, url: String, apiKey: String, jsonBody: String?): PublicMetaDbHttpResponse =
         client.prepareRequest(url) {
+            // A stalled connect on a flaky route (VPN, Cloudflare edge) is better retried quickly than waited out.
+            timeout {
+                connectTimeoutMillis = CONNECT_TIMEOUT_MS
+                requestTimeoutMillis = REQUEST_TIMEOUT_MS
+                socketTimeoutMillis = REQUEST_TIMEOUT_MS
+            }
             this.method = HttpMethod.parse(method)
             header("Accept", "application/json")
             header("Authorization", "Bearer $apiKey")
@@ -159,12 +170,22 @@ internal class PublicMetaDbApi(
     ): String {
         require(apiKey.isNotBlank()) { "PublicMetaDB API key is required" }
         var attempt = 0
+        var networkFailures = 0
         while (true) {
-            val response = gate.withLock {
-                val wait = MIN_GAP_MS - (nowEpochMs() - lastRequestAt)
-                if (wait > 0) delay(wait)
-                lastRequestAt = nowEpochMs()
-                execute(method, path, apiKey, query, body)
+            val response = try {
+                gate.withLock {
+                    val wait = MIN_GAP_MS - (nowEpochMs() - lastRequestAt)
+                    if (wait > 0) delay(wait)
+                    lastRequestAt = nowEpochMs()
+                    execute(method, path, apiKey, query, body)
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                // Connect timeouts and resets (e.g. over a VPN) usually clear on the next attempt.
+                if (networkFailures++ >= MAX_NETWORK_RETRIES) throw error
+                delay(NETWORK_RETRY_BASE_MS shl (networkFailures - 1))
+                continue
             }
             if (response.status in RETRY_STATUSES && attempt < MAX_RETRIES) {
                 val backoff = (response.retryAfterSeconds?.times(1_000L)) ?: (1_000L shl attempt)
@@ -201,6 +222,8 @@ internal class PublicMetaDbApi(
         const val PAGE_SIZE = 100
         private const val MIN_GAP_MS = 50L
         private const val MAX_RETRIES = 3
+        private const val MAX_NETWORK_RETRIES = 3
+        private const val NETWORK_RETRY_BASE_MS = 500L
         private const val MAX_BACKOFF_MS = 15_000L
         private val RETRY_STATUSES = setOf(429, 500, 502, 503)
 

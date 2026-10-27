@@ -19,7 +19,17 @@ internal class PublicMetaDbWatchedProvider(
 ) : TrackingWatchedProvider {
     override val providerId = TrackingProviderId.PMDB
 
-    override suspend fun pull(profileId: Int, pageSize: Int): List<WatchedItem> {
+    override suspend fun pull(profileId: Int, pageSize: Int): List<WatchedItem> = try {
+        pullAll(profileId, pageSize)
+    } catch (error: CancellationException) {
+        throw error
+    } catch (error: Exception) {
+        log.w(error) { "Watched pull failed" }
+        PublicMetaDbDiagnostics.record("watched pull", error)
+        throw error
+    }
+
+    private suspend fun pullAll(profileId: Int, pageSize: Int): List<WatchedItem> {
         val key = apiKey(profileId) ?: return emptyList()
         val items = mutableListOf<PmdbWatchedItem>()
         var page = 1

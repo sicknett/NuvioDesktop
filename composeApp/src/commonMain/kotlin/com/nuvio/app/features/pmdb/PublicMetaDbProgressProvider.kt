@@ -7,14 +7,22 @@ import com.nuvio.app.features.tracking.TrackingProviderId
 import com.nuvio.app.features.watchprogress.WatchProgressEntry
 import com.nuvio.app.features.watchprogress.buildPlaybackVideoId
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.serialization.builtins.ListSerializer
 
 private val log = Logger.withTag("PublicMetaDb")
+private val resumeCacheSerializer = ListSerializer(PmdbResumePoint.serializer())
 
 internal const val PMDB_PROGRESS_SOURCE = "pmdb_playback"
 internal const val PMDB_PROVIDER_STORAGE_ID = "pmdb"
@@ -26,6 +34,10 @@ internal class PublicMetaDbProgressProvider(
     private val apiKey: () -> String?,
     private val ensureAccountLoaded: () -> Unit,
     private val nowEpochMs: () -> Long = { kotlin.time.Clock.System.now().toEpochMilliseconds() },
+    private val activeProfileId: () -> Int = { 1 },
+    private val persistence: () -> PublicMetaDbPersistence = { PublicMetaDbPlatform.persistence },
+    private val autoRetryDelaysMs: List<Long> = listOf(30_000L, 120_000L, 300_000L),
+    private val retryScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
 ) : TrackingProgressProvider {
     override val providerId = TrackingProviderId.PMDB
 
@@ -39,6 +51,7 @@ internal class PublicMetaDbProgressProvider(
 
     private val state = MutableStateFlow(State())
     private val refreshMutex = Mutex()
+    private var retryJob: Job? = null
 
     override val changes: Flow<Unit> = state.map { }
     val lastRefreshedAtEpochMs: Long get() = state.value.refreshedAtEpochMs
@@ -53,6 +66,36 @@ internal class PublicMetaDbProgressProvider(
         state.value = State()
     }
 
+    /** Forgets the on-disk copy too; used when the account is disconnected. */
+    fun clearPersistedCache(profileId: Int = activeProfileId()) {
+        runCatching { persistence().write(resumeCacheKey(profileId), null) }
+    }
+
+    private fun resumeCacheKey(profileId: Int) = "pmdb_resume_cache_$profileId"
+
+    private fun saveCache(points: List<PmdbResumePoint>) {
+        runCatching {
+            persistence().write(resumeCacheKey(activeProfileId()), PublicMetaDbJson.encodeToString(resumeCacheSerializer, points))
+        }
+    }
+
+    /**
+     * Shows the last successful sync until a fresh one lands, so a failed or slow request (VPN, offline)
+     * leaves Continue Watching as it was instead of dropping every in-progress row.
+     */
+    private suspend fun seedFromCacheIfEmpty(apiKey: String) {
+        if (state.value.hasLoaded) return
+        val points = runCatching {
+            persistence().read(resumeCacheKey(activeProfileId()))
+                ?.let { PublicMetaDbJson.decodeFromString(resumeCacheSerializer, it) }
+        }.getOrNull().orEmpty()
+        if (points.isEmpty()) return
+        val entries = points.mapIndexedNotNull { index, point -> toEntry(apiKey, point, null, index) }
+        state.update { current ->
+            if (current.hasLoaded) current else State(points, entries, hasLoaded = true, error = null, refreshedAtEpochMs = 0L)
+        }
+    }
+
     override suspend fun refresh(force: Boolean, sourceChanged: Boolean) {
         ensureAccountLoaded()
         val key = apiKey() ?: return
@@ -62,27 +105,55 @@ internal class PublicMetaDbProgressProvider(
         ) {
             return
         }
+        var retryable = false
         refreshMutex.withLock {
+            seedFromCacheIfEmpty(key)
             try {
-                val points = loadResumePoints(key)
-                val budget = LookupBudget(tmdb = TMDB_LOOKUPS_PER_REFRESH, pmdb = PMDB_LOOKUPS_PER_REFRESH)
-                ids.prefetchImdb(key, points.map { it.tmdbId to it.mediaType }, budget)
-                val entries = points.mapIndexedNotNull { index, point -> toEntry(key, point, null, index) }
-                state.value = State(points, entries, hasLoaded = true, error = null, refreshedAtEpochMs = nowEpochMs())
-                val unparsed = points.count { parsePmdbTimestamp(it.updated ?: it.created) == null }
-                log.i {
-                    "Synced ${points.size} resume points (${entries.size} shown); $unparsed without a usable timestamp; " +
-                        "sample updated='${points.firstOrNull()?.updated}' created='${points.firstOrNull()?.created}'"
-                }
+                refreshOnce(key)
             } catch (error: CancellationException) {
                 throw error
             } catch (error: PublicMetaDbApiException) {
                 log.w(error) { "Resume sync failed (HTTP ${error.status}): ${error.body.take(120)}" }
-                state.update { it.copy(error = describe(error), hasLoaded = it.hasLoaded) }
+                PublicMetaDbDiagnostics.record("resume sync HTTP ${error.status}: ${error.body.take(120)}", error)
+                state.update { it.copy(error = describe(error)) }
+                retryable = !error.isUnauthorized
             } catch (error: Exception) {
                 log.w(error) { "Resume sync failed" }
-                state.update { it.copy(error = "PublicMetaDB sync failed") }
+                PublicMetaDbDiagnostics.record("resume sync", error)
+                state.update { it.copy(error = "PublicMetaDB sync failed (${PublicMetaDbDiagnostics.summary(error)})") }
+                retryable = true
             }
+        }
+        if (retryable) scheduleBackgroundRetry()
+    }
+
+    /**
+     * A sync that fails (offline, congested VPN, service hiccup) is retried in the background with
+     * growing delays, so Continue Watching recovers without waiting for a manual sync or a restart.
+     */
+    private fun scheduleBackgroundRetry() {
+        if (autoRetryDelaysMs.isEmpty() || retryJob?.isActive == true) return
+        retryJob = retryScope.launch {
+            for (wait in autoRetryDelaysMs) {
+                delay(wait)
+                if (apiKey() == null) return@launch
+                refresh(force = true, sourceChanged = false)
+                if (state.value.error == null) return@launch
+            }
+        }
+    }
+
+    private suspend fun refreshOnce(key: String) {
+        val points = loadResumePoints(key)
+        val budget = LookupBudget(tmdb = TMDB_LOOKUPS_PER_REFRESH, pmdb = PMDB_LOOKUPS_PER_REFRESH)
+        ids.prefetchImdb(key, points.map { it.tmdbId to it.mediaType }, budget)
+        val entries = points.mapIndexedNotNull { index, point -> toEntry(key, point, null, index) }
+        state.value = State(points, entries, hasLoaded = true, error = null, refreshedAtEpochMs = nowEpochMs())
+        saveCache(points)
+        val unparsed = points.count { parsePmdbTimestamp(it.updated ?: it.created) == null }
+        log.i {
+            "Synced ${points.size} resume points (${entries.size} shown); $unparsed without a usable timestamp; " +
+                "sample updated='${points.firstOrNull()?.updated}' created='${points.firstOrNull()?.created}'"
         }
     }
 
@@ -117,6 +188,7 @@ internal class PublicMetaDbProgressProvider(
                 entries = current.entries.filterNot { it.trackingProviderItemId in removed },
             )
         }
+        if (state.value.hasLoaded) saveCache(state.value.points)
     }
 
     /** Drops any local resume row for a title that was just completed or otherwise superseded. */
@@ -128,6 +200,7 @@ internal class PublicMetaDbProgressProvider(
                 entries = current.entries.filterNot { it.trackingProviderItemId in gone },
             )
         }
+        if (state.value.hasLoaded) saveCache(state.value.points)
     }
 
     suspend fun findResumeId(apiKey: String, target: PmdbTarget): String? {

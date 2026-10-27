@@ -52,10 +52,13 @@ private class Harness(
         },
         nowEpochMs = { 1_000_000L },
     )
-    private val storage = MemoryPersistence()
+    val storage = MemoryPersistence()
     val ids = PublicMetaDbIds(api, tmdb) { storage }
     val watched = PublicMetaDbWatchedProvider(api, ids, apiKey = { KEY }, nowEpochMs = { 1_000_000L })
-    val progress = PublicMetaDbProgressProvider(api, ids, apiKey = { KEY }, ensureAccountLoaded = {}, nowEpochMs = { 1_000_000L })
+    val progress = PublicMetaDbProgressProvider(
+        api, ids, apiKey = { KEY }, ensureAccountLoaded = {}, nowEpochMs = { 1_000_000L }, persistence = { storage },
+        autoRetryDelaysMs = emptyList(),
+    )
     val writes = PublicMetaDbTrackingWrites(api, ids, progress, apiKey = { KEY }, nowEpochMs = { 1_000_000L })
 
     fun calls(method: String, path: String) = calls.filter { it.method == method && it.path == path }
@@ -400,6 +403,87 @@ class PublicMetaDbTest {
         assertEquals(603L, h.calls("POST", "/watched").single().body!!["tmdb_id"]!!.jsonPrimitive.long)
         h.watched.delete(1, listOf(item))
         assertTrue("tmdb_id=603" in h.calls("DELETE", "/watched").single().query)
+    }
+
+    @Test
+    fun transientNetworkFailuresAreRetried() = runTest {
+        var sends = 0
+        val api = PublicMetaDbApi(
+            transport = { _, _, _, _ -> if (sends++ < 2) throw RuntimeException("connect timeout") else ok("""{"items":[]}""") },
+            nowEpochMs = { 1_000_000L },
+        )
+        api.resumePage("k", 1)
+        assertEquals(3, sends)
+    }
+
+    @Test
+    fun persistentNetworkFailureSurfacesAfterTheRetries() = runTest {
+        var sends = 0
+        val api = PublicMetaDbApi(
+            transport = { _, _, _, _ -> sends++; throw RuntimeException("connect timeout") },
+            nowEpochMs = { 1_000_000L },
+        )
+        val failure = runCatching { api.resumePage("k", 1) }.exceptionOrNull()
+        assertTrue(failure is RuntimeException)
+        assertEquals(4, sends)
+    }
+
+    @Test
+    fun lastGoodResumePointsSurviveAnUnreachableService() = runTest {
+        val online = Harness { call ->
+            if (call.path == "/resume") {
+                ok("""{"items":[{"id":"r1","tmdb_id":603,"media_type":"movie","position_ms":50,"runtime_ms":100,"title":"The Matrix"}],"totalPages":1}""")
+            } else {
+                status(404)
+            }
+        }
+        online.progress.refresh(force = true, sourceChanged = false)
+        assertEquals(1, online.progress.snapshot().entries.size)
+
+        // A fresh start (new provider, same storage) while the service cannot be reached.
+        val offlineApi = PublicMetaDbApi(transport = { _, _, _, _ -> throw RuntimeException("offline") }, nowEpochMs = { 1_000_000L })
+        val offlineIds = PublicMetaDbIds(offlineApi, NoTmdbIdResolver) { online.storage }
+        val offline = PublicMetaDbProgressProvider(
+            offlineApi, offlineIds, apiKey = { Harness.KEY }, ensureAccountLoaded = {},
+            nowEpochMs = { 1_000_000L }, persistence = { online.storage }, autoRetryDelaysMs = emptyList(),
+        )
+        offline.refresh(force = true, sourceChanged = false)
+        val snapshot = offline.snapshot()
+        assertEquals(1, snapshot.entries.size)
+        assertEquals("The Matrix", snapshot.entries.single().title)
+        assertTrue(snapshot.errorMessage != null)
+
+        offline.clearPersistedCache()
+        offline.clearLocalState()
+        offline.refresh(force = true, sourceChanged = false)
+        assertTrue(offline.snapshot().entries.isEmpty())
+    }
+
+    @Test
+    fun failedSyncRetriesInTheBackgroundUntilItSucceeds() = runTest {
+        var sends = 0
+        val api = PublicMetaDbApi(
+            transport = { _, _, _, _ ->
+                // the first sync burns all four network attempts; the background retry then gets through
+                if (sends++ < 4) throw RuntimeException("connect timeout")
+                ok("""{"items":[{"id":"r1","tmdb_id":603,"media_type":"movie","position_ms":50,"runtime_ms":100}],"totalPages":1}""")
+            },
+            nowEpochMs = { 1_000_000L },
+        )
+        val storage = MemoryPersistence()
+        val provider = PublicMetaDbProgressProvider(
+            api, PublicMetaDbIds(api, NoTmdbIdResolver) { storage }, apiKey = { Harness.KEY }, ensureAccountLoaded = {},
+            nowEpochMs = { 1_000_000L }, persistence = { storage },
+            autoRetryDelaysMs = listOf(30_000L), retryScope = backgroundScope,
+        )
+        provider.refresh(force = true, sourceChanged = false)
+        assertTrue(provider.snapshot().errorMessage != null)
+        assertTrue(provider.snapshot().entries.isEmpty())
+
+        testScheduler.advanceTimeBy(31_000L)
+        testScheduler.runCurrent()
+        assertNull(provider.snapshot().errorMessage)
+        assertEquals(1, provider.snapshot().entries.size)
     }
 
     @Test
