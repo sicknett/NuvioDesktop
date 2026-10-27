@@ -68,6 +68,7 @@ internal suspend fun recordExternalPlaybackProgress(
                     event = TrackingScrobbleEvent(
                         media = media,
                         progressPercent = (result.positionMs.toDouble() / durationMs.toDouble() * 100).coerceIn(0.0, 100.0),
+                        durationMs = durationMs,
                     ),
                 )
             }

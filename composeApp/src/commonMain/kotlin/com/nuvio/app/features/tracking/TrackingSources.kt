@@ -8,13 +8,15 @@ enum class WatchProgressSource {
     TRAKT,
     SIMKL,
     NUVIO_SYNC,
-    MDBLIST;
+    MDBLIST,
+    PMDB;
 
     val providerId: TrackingProviderId?
         get() = when (this) {
             TRAKT -> TrackingProviderId.TRAKT
             SIMKL -> TrackingProviderId.SIMKL
             MDBLIST -> TrackingProviderId.MDBLIST
+            PMDB -> TrackingProviderId.PMDB
             NUVIO_SYNC -> null
         }
 

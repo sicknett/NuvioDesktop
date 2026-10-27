@@ -201,6 +201,7 @@ internal fun TrackingProviderCards(
             modifier = Modifier.fillMaxWidth(),
         )
         MdbListProviderCard(Modifier.fillMaxWidth())
+        PublicMetaDbProviderCard(Modifier.fillMaxWidth())
     }
 
     if (showSyncInfo) {

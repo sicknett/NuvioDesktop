@@ -271,6 +271,7 @@ private fun PlayerScreenRuntime.emitTrackingScrobbleTerminal(
     if (!hasRequestedScrobbleStartForCurrentItem && (provided ?: 0f) < 80f) return
 
     val percent = provided ?: currentPlaybackProgressPercent()
+    val durationSnapshotMs = playbackSnapshot.durationMs.takeIf { it > 0L }
     val mediaSnapshot = currentTrackingMedia
     val inputsSnapshot = snapshotTrackingScrobbleItemInputs()
     scope.launch(NonCancellable) {
@@ -279,7 +280,11 @@ private fun PlayerScreenRuntime.emitTrackingScrobbleTerminal(
         TrackingScrobbleCoordinator.scrobble(
             profileId = profileId,
             action = action,
-            event = TrackingScrobbleEvent(media = media, progressPercent = percent.toDouble()),
+            event = TrackingScrobbleEvent(
+                media = media,
+                progressPercent = percent.toDouble(),
+                durationMs = durationSnapshotMs,
+            ),
         )
     }
     currentTrackingMedia = null
@@ -399,6 +404,7 @@ internal fun PlayerScreenRuntime.scheduleProgressSyncAfterSeek() {
         val stopEvent = TrackingScrobbleEvent(
             media = media,
             progressPercent = progressPercent.toDouble(),
+            durationMs = playbackSnapshot.durationMs.takeIf { it > 0L },
         )
         scope.launch {
             if (isShortPlaceholderDuration(playbackSnapshot.durationMs)) return@launch

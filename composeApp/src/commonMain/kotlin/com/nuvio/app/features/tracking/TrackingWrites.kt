@@ -32,6 +32,8 @@ data class TrackingHistoryItem(
 data class TrackingScrobbleEvent(
     val media: TrackingMediaReference,
     val progressPercent: Double,
+    /** Total runtime when the player knows it; providers that store absolute positions need it. */
+    val durationMs: Long? = null,
 )
 
 data class TrackingMutationResult(
