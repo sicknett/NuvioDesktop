@@ -86,6 +86,8 @@ import nuvio.composeapp.generated.resources.settings_playback_option_forced
 import nuvio.composeapp.generated.resources.settings_playback_option_none
 import nuvio.composeapp.generated.resources.settings_playback_option_original
 import nuvio.composeapp.generated.resources.subtitle_language_unknown
+import kotlinx.atomicfu.locks.SynchronizedObject
+import kotlinx.atomicfu.locks.synchronized
 import org.jetbrains.compose.resources.StringResource
 import org.jetbrains.compose.resources.getString
 import org.jetbrains.compose.resources.stringResource
@@ -377,7 +379,31 @@ private val LanguageNameAliases = mapOf(
     "zulu" to "zu",
 )
 
+private val WhitespaceRun = Regex("\\s+")
+
+// Longest name first so "chinese traditional" wins over "chinese"; sorted once, not per call.
+private val LanguageNameAliasesLongestFirst = LanguageNameAliases.entries.sortedByDescending { it.key.length }
+
+private const val NormalizedLanguageCacheLimit = 1024
+private val normalizedLanguageCacheLock = SynchronizedObject()
+private val normalizedLanguageCache = HashMap<String, String>()
+
+/**
+ * Called for every audio/subtitle track label whenever the player UI recomposes, so results are
+ * memoized. The result depends only on the input string.
+ */
 fun normalizeLanguageCode(language: String?): String? {
+    val key = language?.takeIf { it.isNotBlank() } ?: return null
+    synchronized(normalizedLanguageCacheLock) { normalizedLanguageCache[key] }?.let { return it }
+    val normalized = computeNormalizedLanguageCode(key) ?: return null
+    synchronized(normalizedLanguageCacheLock) {
+        if (normalizedLanguageCache.size >= NormalizedLanguageCacheLimit) normalizedLanguageCache.clear()
+        normalizedLanguageCache[key] = normalized
+    }
+    return normalized
+}
+
+private fun computeNormalizedLanguageCode(language: String?): String? {
     val raw = language
         ?.trim()
         ?.replace('_', '-')
@@ -389,7 +415,7 @@ fun normalizeLanguageCode(language: String?): String? {
         .replace('-', ' ')
         .replace('.', ' ')
         .replace('/', ' ')
-        .replace(Regex("\\s+"), " ")
+        .replace(WhitespaceRun, " ")
         .trim()
 
     fun containsAny(vararg values: String): Boolean =
@@ -415,8 +441,7 @@ fun normalizeLanguageCode(language: String?): String? {
 
     LanguageCodeAliases[raw]?.let { return it.replace('_', '-').lowercase() }
     LanguageNameAliases[tokenized]?.let { return it }
-    LanguageNameAliases.entries
-        .sortedByDescending { it.key.length }
+    LanguageNameAliasesLongestFirst
         .firstOrNull { (name, _) ->
             tokenized == name ||
                 tokenized.startsWith("$name ") ||
@@ -447,11 +472,18 @@ fun languageMatchesPreference(trackLanguage: String?, targetLanguage: String): B
     return trackPrimary == targetPrimary
 }
 
+// First option wins for a normalized code, matching the previous linear firstOrNull lookup.
+private val LanguageLabelResByNormalizedCode: Map<String, StringResource> by lazy {
+    buildMap {
+        AvailableLanguageOptions.forEach { option ->
+            normalizeLanguageCode(option.code)?.let { normalized -> putIfAbsent(normalized, option.labelRes) }
+        }
+    }
+}
+
 internal fun languageLabelResForCode(code: String?): StringResource? {
     val normalized = normalizeLanguageCode(code) ?: return null
-    return AvailableLanguageOptions.firstOrNull {
-        normalizeLanguageCode(it.code) == normalized
-    }?.labelRes
+    return LanguageLabelResByNormalizedCode[normalized]
 }
 
 @Composable
