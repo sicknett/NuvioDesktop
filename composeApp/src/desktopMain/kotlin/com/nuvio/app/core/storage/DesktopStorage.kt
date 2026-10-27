@@ -41,6 +41,9 @@ internal object DesktopStorage {
     }
 
     private fun resolveAppDataDir(): Path {
+        // A build can pin its own data folder (-Dnuvio.data.dir=...) so it never shares settings with another
+        // Nuvio install, however it is launched.
+        System.getProperty("nuvio.data.dir")?.takeIf { it.isNotBlank() }?.let { return Paths.get(it) }
         val osName = System.getProperty("os.name").orEmpty().lowercase(Locale.ROOT)
         val userHome = Paths.get(System.getProperty("user.home").orEmpty())
         return when {

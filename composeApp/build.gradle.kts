@@ -1275,11 +1275,20 @@ compose.desktop {
             "--add-opens=java.desktop/sun.awt.windows=ALL-UNNAMED",
             "--add-opens=java.desktop/sun.awt.X11=ALL-UNNAMED",
             smokePlayerUrl?.takeIf { it.isNotBlank() }?.let { "-Dnuvio.desktop.smokePlayerUrl=$it" },
+            // Optional, for a side-by-side build that must keep its own settings (and avoid long temp paths).
+            providers.gradleProperty("nuvio.desktop.dataDir").orNull?.takeIf { it.isNotBlank() }
+                ?.let { "-Dnuvio.data.dir=$it" },
+            providers.gradleProperty("nuvio.desktop.tempDir").orNull?.takeIf { it.isNotBlank() }
+                ?.let { "-Djava.io.tmpdir=$it" },
+            // JDK 21 on Windows opens its network selectors over a Unix-domain socket in this folder; a long or
+            // 8.3-style temp path in the environment can stall connections, so pin it alongside java.io.tmpdir.
+            providers.gradleProperty("nuvio.desktop.tempDir").orNull?.takeIf { it.isNotBlank() }
+                ?.let { "-Djdk.net.unixdomain.tmpdir=$it" },
         )
 
         nativeDistributions {
             targetFormats(TargetFormat.Dmg, TargetFormat.Msi, TargetFormat.Deb, TargetFormat.Rpm, TargetFormat.AppImage)
-            packageName = "Nuvio"
+            packageName = providers.gradleProperty("nuvio.desktop.packageName").orNull?.takeIf { it.isNotBlank() } ?: "Nuvio"
             packageVersion = desktopReleasePackageVersion
             vendor = "Nuvio Media"
             if (isMacHost) {
