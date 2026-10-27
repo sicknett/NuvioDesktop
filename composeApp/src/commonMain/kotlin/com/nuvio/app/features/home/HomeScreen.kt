@@ -572,6 +572,15 @@ fun HomeScreen(
         continueWatchingListState.scrollToItem(0)
         upcomingListState.scrollToItem(0)
     }
+    // Items can arrive after the first frame (tracker sync, next-up resolution) and land ahead of the item
+    // that was first. A keyed lazy row follows that item, so the row would open scrolled to the end; until the
+    // user scrolls it themselves, keep it at the start.
+    LaunchedEffect(continueWatchingItems) {
+        if (!hasUserScrolledContinueWatching) continueWatchingListState.scrollToItem(0)
+    }
+    LaunchedEffect(upcomingItems) {
+        if (!hasUserScrolledUpcoming) upcomingListState.scrollToItem(0)
+    }
     val enabledAddons = remember(addonsUiState.addons) {
         addonsUiState.addons.enabledAddons()
     }
