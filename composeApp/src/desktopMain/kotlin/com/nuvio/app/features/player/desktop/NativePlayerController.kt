@@ -2,6 +2,7 @@ package com.nuvio.app.features.player.desktop
 
 import androidx.compose.ui.graphics.Color
 import co.touchlab.kermit.Logger
+import com.nuvio.app.features.settings.DesktopAudioSettings
 import com.nuvio.app.features.player.PlayerControlAddonSubtitleItem
 import com.nuvio.app.features.player.PlayerControlEpisodeItem
 import com.nuvio.app.features.player.PlayerControlFilterItem
@@ -1117,6 +1118,9 @@ internal class NativePlayerController(
 
     private fun applyPendingSubtitleSettings() {
         val current = handle.takeIf { it != 0L } ?: return
+        DesktopAudioSettings.delayMs.takeIf { it != 0 }?.let { delayMs ->
+            runCatching { NativePlayerBridge.setAudioDelayMs(current, delayMs) }
+        }
         pendingSubtitleDelayMs?.let { delayMs ->
             NativePlayerBridge.setSubtitleDelayMs(current, delayMs)
         }

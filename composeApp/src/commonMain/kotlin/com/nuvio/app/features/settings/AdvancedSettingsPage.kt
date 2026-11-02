@@ -115,6 +115,9 @@ internal fun LazyListScope.advancedSettingsContent(
             }
         }
     }
+    if (DesktopAudioSettings.isSupported) {
+        item { DesktopAudioDelaySection(isTablet = isTablet) }
+    }
     if (SentrySettingsRepository.isSupported) {
         item {
             val sentryEnabledFlow = remember {

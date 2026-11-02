@@ -117,6 +117,9 @@ internal object NativePlayerBridge {
     external fun setMacosWindowFullscreen(windowViewPtr: Long, fullscreen: Boolean)
 
     external fun setSubtitleDelayMs(handle: Long, delayMs: Int)
+
+    /** Windows only for now; other native bridges do not export it, so callers must tolerate a missing symbol. */
+    external fun setAudioDelayMs(handle: Long, delayMs: Int)
     external fun applySubtitleStyle(
         handle: Long,
         textColor: String,

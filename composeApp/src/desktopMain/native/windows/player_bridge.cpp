@@ -1267,6 +1267,15 @@ public:
         }
     }
 
+    // mpv's audio-delay: positive values delay the video (use when audio, e.g. over Bluetooth, runs behind it).
+    void setAudioDelayMs(int delayMs) {
+        std::lock_guard<std::mutex> lock(mpvMutex);
+        if (!mpv) return;
+        int clamped = std::max(-5000, std::min(5000, delayMs));
+        double delaySeconds = (double)clamped / 1000.0;
+        mpvApi().setProperty(mpv, "audio-delay", MPV_FORMAT_DOUBLE, &delaySeconds);
+    }
+
     void setSubtitleDelayMs(int delayMs) {
         std::lock_guard<std::mutex> lock(mpvMutex);
         if (!mpv) return;
@@ -2987,6 +2996,12 @@ Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_setWindowBorderles
         width,
         height
     );
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_setAudioDelayMs(JNIEnv *, jobject, jlong handle, jint delayMs) {
+    auto player = playerFromHandle(handle);
+    if (player) player->setAudioDelayMs(delayMs);
 }
 
 extern "C" JNIEXPORT void JNICALL
