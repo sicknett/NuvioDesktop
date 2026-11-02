@@ -18,6 +18,7 @@
 #include <condition_variable>
 #include <cctype>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cwctype>
 #include <deque>
@@ -1228,6 +1229,7 @@ public:
         if (!mpv) return;
         int64_t id = trackId;
         mpvApi().setProperty(mpv, "aid", MPV_FORMAT_INT64, &id);
+        if (trackId > 0) lastWorkingAudioId = trackId;  // the user's choice is what recovery should restore
     }
 
     void setAudioLanguages(const std::string &languages) {
@@ -2049,11 +2051,84 @@ private:
             }
 
             mpv_event *event = mpvApi().waitEvent(current, 0.5);
-            if (!event) continue;
-            if (event->event_id == MPV_EVENT_SHUTDOWN) {
+            if (event && event->event_id == MPV_EVENT_SHUTDOWN) {
                 return;
             }
+            audioRecoveryTick();
         }
+    }
+
+    // --- Audio recovery ---------------------------------------------------------------------------
+    // When the audio device disappears (a Bluetooth headset drops, or comes back as a new endpoint) and no
+    // output can be opened, mpv drops its audio output AND deselects the audio track (aid becomes "no");
+    // the video keeps playing in silence and nothing brings the sound back when the device returns.
+    // Re-selecting the same numeric track once the device is back restores it ("auto" does not), and
+    // retrying while the device is still missing is harmless, so remember the last track that had working
+    // output and re-select it until output returns. The app never turns audio off itself, so aid "no"
+    // while a file with sound is playing always means the output was lost.
+    std::atomic<long long> lastWorkingAudioId{0};
+    std::chrono::steady_clock::time_point lastAudioRecoveryTick{};
+    std::chrono::steady_clock::time_point lastAudioRecoveryAttempt{};
+    std::string audioRecoveryPath;
+    std::string lastAudioDeviceList;
+    int audioDevicePollCounter = 0;
+    int audioRecoveryAttempts = 0;
+
+    void audioRecoveryTick() {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - lastAudioRecoveryTick < std::chrono::milliseconds(450)) return;
+        lastAudioRecoveryTick = now;
+
+        if (flagProperty("idle-active", true)) {
+            lastWorkingAudioId = 0;
+            audioRecoveryPath.clear();
+            audioRecoveryAttempts = 0;
+            return;
+        }
+
+        // A different file starts from scratch: never carry a track number across files.
+        const std::string path = stringProperty("path", "");
+        if (path != audioRecoveryPath) {
+            audioRecoveryPath = path;
+            lastWorkingAudioId = 0;
+            audioRecoveryAttempts = 0;
+        }
+
+        // A device appearing or disappearing means a new chance to recover.
+        if (++audioDevicePollCounter >= 2) {
+            audioDevicePollCounter = 0;
+            std::string devices = stringProperty("audio-device-list", "");
+            if (!devices.empty()) {
+                if (!lastAudioDeviceList.empty() && devices != lastAudioDeviceList) {
+                    audioRecoveryAttempts = 0;
+                    lastAudioRecoveryAttempt = std::chrono::steady_clock::time_point{};
+                }
+                lastAudioDeviceList = std::move(devices);
+            }
+        }
+
+        const std::string aid = stringProperty("aid", "no");
+        char *end = nullptr;
+        const long long aidNumber = std::strtoll(aid.c_str(), &end, 10);
+        const bool aidIsTrack = end != aid.c_str() && *end == '\0' && aidNumber > 0;
+        const bool hasAudioOutput = !stringProperty("current-ao", "").empty();
+
+        if (aidIsTrack) {
+            if (hasAudioOutput) {
+                lastWorkingAudioId = aidNumber;
+                audioRecoveryAttempts = 0;
+            }
+            return;  // track selected: output is opening, or working
+        }
+
+        const long long wanted = lastWorkingAudioId.load();
+        if (wanted <= 0 || hasAudioOutput) return;  // never had sound in this file, or nothing is lost
+        const bool cooledDown = lastAudioRecoveryAttempt.time_since_epoch().count() == 0 ||
+            now - lastAudioRecoveryAttempt >= std::chrono::seconds(3);
+        if (!cooledDown || audioRecoveryAttempts >= 200) return;
+        lastAudioRecoveryAttempt = now;
+        ++audioRecoveryAttempts;
+        setStringProperty("aid", std::to_string(wanted));
     }
 
     JNIEnv *jniEnvDidAttach(bool *didAttach) {
